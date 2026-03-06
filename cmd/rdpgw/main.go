@@ -108,6 +108,8 @@ func main() {
 		EnableUserToken:  conf.Security.EnableUserToken,
 		Hosts:            conf.Server.Hosts,
 		HostSelection:    conf.Server.HostSelection,
+		Domain:          conf.Server.Domain,
+		DefaultHostPort: conf.Server.DefaultHostPort,
 		RdpOpts: web.RdpOpts{
 			UsernameTemplate: conf.Client.UsernameTemplate,
 			SplitUserDomain:  conf.Client.SplitUserDomain,

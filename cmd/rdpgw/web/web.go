@@ -12,10 +12,12 @@ import (
 	"html/template"
 	"log"
 	rnd "math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +44,8 @@ type Config struct {
 	RdpSigningCert     string
 	RdpSigningKey      string
 	TemplatesPath      string
+	Domain             string // NEW: Domain to validate hosts against
+	DefaultHostPort    string // NEW: Default port to append if not specified
 }
 
 // WebConfig represents the web interface configuration
@@ -89,6 +93,8 @@ type Handler struct {
 	templatesPath      string
 	webConfig          *WebConfig
 	htmlTemplate       *template.Template
+	domain             string // NEW: Domain to validate hosts against
+	defaultHostPort    string // NEW: Default port to append if not specified
 }
 
 func (c *Config) NewHandler() *Handler {
@@ -108,6 +114,14 @@ func (c *Config) NewHandler() *Handler {
 		rdpOpts:            c.RdpOpts,
 		rdpDefaults:        c.TemplateFile,
 		templatesPath:      c.TemplatesPath,
+		domain:             c.Domain,             // NEW
+		defaultHostPort:    c.DefaultHostPort,    // NEW
+	}
+
+	// Set default port if not specified
+	if handler.defaultHostPort == "" {
+		handler.defaultHostPort = "3389"
+		log.Printf("DefaultHostPort not set, using default: 3389")
 	}
 
 	// set up RDP signer if config values are set
@@ -351,6 +365,211 @@ func (h *Handler) selectRandomHost() string {
 	return host
 }
 
+// NEW: validateAndNormalizeHost validates the host and normalizes the port.
+//
+// Port preservation rules:
+//   - If the request includes a port, it is always preserved as-is.
+//   - If the request has no port, defaultHostPort is used.
+//
+// Validation rules:
+//   - IPv4 addresses must be RFC1918 and matched by an IP/CIDR entry in h.hosts.
+//     Port is only enforced when the matching hosts entry is a single explicit
+//     host+port (e.g. "192.168.1.50:3390"). CIDR and bare-IP entries permit any port.
+//   - FQDNs are validated against h.domain (suffix match).
+//     Port is only enforced when the matching hosts entry is a single explicit
+//     host+port (e.g. "hosta.mydomain.local:3390"). Domain-only entries permit any port.
+func (h *Handler) validateAndNormalizeHost(hostParam string) (string, error) {
+	if hostParam == "" {
+		return "", errors.New("host parameter is required")
+	}
+
+	// Separate hostname and port from the request parameter.
+	// If the caller supplied a port we keep it; otherwise fall back to default.
+	var hostname string
+	var port string
+	var requestHasPort bool
+
+	if strings.Contains(hostParam, ":") {
+		parts := strings.SplitN(hostParam, ":", 2)
+		if len(parts) != 2 {
+			return "", fmt.Errorf("invalid host format: %s", hostParam)
+		}
+		hostname = parts[0]
+		port = parts[1]
+		requestHasPort = true
+
+		portNum, err := strconv.Atoi(port)
+		if err != nil {
+			return "", fmt.Errorf("invalid port number: %s", port)
+		}
+		if portNum < 1 || portNum > 65535 {
+			return "", fmt.Errorf("port number out of range: %d", portNum)
+		}
+	} else {
+		hostname = hostParam
+		port = h.defaultHostPort
+		requestHasPort = false
+	}
+
+	// ── IPv4 path ────────────────────────────────────────────────────────────
+	if ip := net.ParseIP(hostname); ip != nil {
+		ip4 := ip.To4()
+		if ip4 == nil {
+			return "", fmt.Errorf("IPv6 addresses are not permitted")
+		}
+		if !isRFC1918IP(ip4) {
+			return "", fmt.Errorf("only RFC1918 private addresses are permitted")
+		}
+		if err := h.validateIPAgainstHosts(ip4, port, requestHasPort); err != nil {
+			log.Printf("RFC1918 address %s rejected: %v", hostname, err)
+			return "", err
+		}
+		log.Printf("Allowing RFC1918 address %s:%s", hostname, port)
+		return fmt.Sprintf("%s:%s", hostname, port), nil
+	}
+
+	// ── FQDN path ────────────────────────────────────────────────────────────
+	if h.domain != "" {
+		if !strings.Contains(hostname, ".") {
+			return "", fmt.Errorf("invalid host")
+		}
+		if !strings.HasSuffix(hostname, h.domain) {
+			return "", fmt.Errorf("invalid host")
+		}
+		// Prevent label-boundary tricks e.g. "evilhost.linode.mydomain.local"
+		if len(hostname) > len(h.domain) {
+			if hostname[len(hostname)-len(h.domain)-1] != '.' {
+				return "", fmt.Errorf("invalid host")
+			}
+		}
+		if err := h.validateFQDNAgainstHosts(hostname, port, requestHasPort); err != nil {
+			log.Printf("FQDN %s rejected: %v", hostname, err)
+			return "", err
+		}
+	}
+
+	return fmt.Sprintf("%s:%s", hostname, port), nil
+}
+
+// isRFC1918IP returns true if ip falls within 10/8, 172.16/12, or 192.168/16.
+func isRFC1918IP(ip net.IP) bool {
+	for _, cidr := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitHostEntry splits a hosts config entry into its address/CIDR part and
+// an optional port string. Returns ("", "") on malformed input.
+// Examples:
+//
+//	"192.168.1.50"        → ("192.168.1.50", "")
+//	"192.168.1.50:3390"   → ("192.168.1.50", "3390")
+//	"192.168.1.0/24"      → ("192.168.1.0/24", "")
+//	"hosta.domain.local"  → ("hosta.domain.local", "")
+//	"hosta.domain.local:3390" → ("hosta.domain.local", "3390")
+func splitHostEntry(entry string) (hostPart, portPart string) {
+	if !strings.Contains(entry, ":") {
+		return entry, ""
+	}
+	idx := strings.LastIndex(entry, ":")
+	return entry[:idx], entry[idx+1:]
+}
+
+// validateIPAgainstHosts checks ip against IP/CIDR entries in h.hosts.
+//
+// Port enforcement:
+//   - If the hosts entry is a single explicit IP with a port (e.g. "192.168.1.50:3390"),
+//     the request port must match that port.
+//   - CIDR entries and bare-IP entries (no port) accept any port — the caller's
+//     port (explicit or defaulted) is preserved unchanged.
+func (h *Handler) validateIPAgainstHosts(ip net.IP, requestPort string, requestHasPort bool) error {
+	for _, entry := range h.hosts {
+		hostPart, entryPort := splitHostEntry(entry)
+
+		// ── exact IP entry ──────────────────────────────────────────────────
+		if candidate := net.ParseIP(hostPart); candidate != nil {
+			if candidate.To4() == nil || !candidate.To4().Equal(ip) {
+				continue
+			}
+			// IP matches. If the entry pins a specific port, enforce it.
+			if entryPort != "" {
+				if requestHasPort && requestPort != entryPort {
+					return fmt.Errorf("port %s not permitted for this host (expected %s)", requestPort, entryPort)
+				}
+				// No port in request → fine, defaultHostPort will be used.
+			}
+			return nil
+		}
+
+		// ── CIDR entry ──────────────────────────────────────────────────────
+		// CIDR entries never carry a port constraint; any port is allowed.
+		_, network, err := net.ParseCIDR(hostPart)
+		if err != nil {
+			continue // FQDN or unrecognised entry — skip
+		}
+		if network.Contains(ip) {
+			return nil
+		}
+	}
+	return fmt.Errorf("address not permitted by host configuration")
+}
+
+// validateFQDNAgainstHosts checks hostname against FQDN entries in h.hosts.
+//
+// Port enforcement:
+//   - If the hosts entry is a single explicit hostname with a port
+//     (e.g. "hosta.mydomain.local:3390"), the request port must match.
+//   - Domain-only / wildcard-style entries (no port) accept any port.
+//
+// If h.hosts contains no FQDN entries at all the function returns nil,
+// deferring authority entirely to the domain-suffix check already performed
+// by the caller.
+func (h *Handler) validateFQDNAgainstHosts(hostname, requestPort string, requestHasPort bool) error {
+	hasFQDNEntry := false
+
+	for _, entry := range h.hosts {
+		hostPart, entryPort := splitHostEntry(entry)
+
+		// Skip IP and CIDR entries.
+		if net.ParseIP(hostPart) != nil {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(hostPart); err == nil {
+			continue
+		}
+
+		hasFQDNEntry = true
+
+		// Exact hostname match (case-insensitive).
+		if !strings.EqualFold(hostPart, hostname) {
+			continue
+		}
+
+		// Hostname matches. Enforce port only when the entry pins one.
+		if entryPort != "" {
+			if requestHasPort && requestPort != entryPort {
+				return fmt.Errorf("port %s not permitted for this host (expected %s)", requestPort, entryPort)
+			}
+		}
+		return nil
+	}
+
+	// If there were FQDN entries but none matched, reject.
+	// If there were NO FQDN entries at all, the domain-suffix check is sufficient.
+	if hasFQDNEntry {
+		return fmt.Errorf("host not found in allowed list")
+	}
+	return nil
+}
+
+///////end new stuff///
 func (h *Handler) getHost(ctx context.Context, u *url.URL) (string, error) {
 	switch h.hostSelection {
 	case "roundrobin":
@@ -381,20 +600,37 @@ func (h *Handler) getHost(ctx context.Context, u *url.URL) (string, error) {
 		if !ok {
 			return "", errors.New("invalid query parameter")
 		}
+		
+		// NEW: Validate and normalize the host
+		normalizedHost, err := h.validateAndNormalizeHost(hosts[0])
+		if err != nil {
+			log.Printf("Host validation failed for %s: %v", hosts[0], err)
+			return "", fmt.Errorf("invalid host: %v", err)
+		}
+		
+		// Check if normalized host is in allowed list
 		for _, check := range h.hosts {
-			if check == hosts[0] {
-				return hosts[0], nil
+			if check == normalizedHost {
+				return normalizedHost, nil
 			}
 		}
 		// not found
-		log.Printf("Invalid host %s specified in client request", hosts[0])
+		log.Printf("Invalid host %s specified in client request", normalizedHost)
 		return "", errors.New("invalid host specified in query parameter")
 	case "any":
 		hosts, ok := u.Query()["host"]
 		if !ok {
 			return "", errors.New("invalid query parameter")
 		}
-		return hosts[0], nil
+		
+		// NEW: Validate and normalize the host even for "any" mode
+		normalizedHost, err := h.validateAndNormalizeHost(hosts[0])
+		if err != nil {
+			log.Printf("Host validation failed for %s: %v", hosts[0], err)
+			return "", fmt.Errorf("invalid host: %v", err)
+		}
+		
+		return normalizedHost, nil
 	default:
 		return h.selectRandomHost(), nil
 	}

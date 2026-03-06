@@ -44,6 +44,8 @@ type ServerConfig struct {
 	Port                 int      `koanf:"port"`
 	CertFile             string   `koanf:"certfile"`
 	KeyFile              string   `koanf:"keyfile"`
+	Domain               string   `koanf:"domain"`
+	DefaultHostPort      string   `koanf:"defaulthostport"`
 	Hosts                []string `koanf:"hosts"`
 	HostSelection        string   `koanf:"hostselection"`
 	SessionKey           string   `koanf:"sessionkey"`
