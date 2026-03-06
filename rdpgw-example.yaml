@@ -1,0 +1,79 @@
+Server:
+  # PAM authentication only - no keytab needed
+  Authentication:
+    #- local-pam
+    #- ntlm 
+    #- kerberos  #AuthSocket: /tmp/rdpgw-auth.sock
+    - openid
+  # PAM service configuration
+  #PamService: rdpgw
+  Domain: your.example.domain
+  DefaultHostPort: 3389  
+  # Certificate files
+  # Public certs for the web/tls exposure
+  Tls: enable 
+  CertFile: /opt/rdpgw/server.pem
+    #If using LetsEncrypt - copy the below files to your rdpgw install and ensure rdpgw user can read
+    #CertFile: /etc/letsencrypt/archive/your.example.domain/cert1.pem
+    #KeyFile: /etc/letsencrypt/archive/your.example.domain/privkey1.pem
+  KeyFile: /opt/rdpgw/key.pem
+  
+  # Gateway address
+  GatewayAddress: your-rds-server-name.your.example.domain
+  
+  # Port for RDP GW Server to listen on
+  Port: 443
+ # Host configuration - CAP/RAP equivalent
+# This allows all authenticated domain users to connect to any RDP host
+  Hosts:
+    #These will be read by the web interface and allow/disallow Connect?Host=... based on this. These can be any of the following below. In the case where you specify a single host, the default port can be overridden as shown. However, in that case, the Connect?Host= should also take in that port using host:port format
+    - "*.your.example.domain"
+    - "myhost.your.example.domain:3391"
+    - "192.168.100.254:3390"
+    - "192.168.1.0/24"
+  HostSelection: any
+
+  # Session configuration (replace with your generated keys)
+  # Required for operation
+  SessionKey: 
+  SessionEncryptionKey: 
+  SessionStore: cookie
+  #SessionStore: file
+# Security settings
+#Kerberos:
+  #Keytab: /etc/krb5.keytab
+  #Krb5conf: /etc/krb5.conf    
+Security:
+  # PAA token signing key (replace with your generated key)
+  # Required for operation
+  PAATokenSigningKey: 
+  PAATokenEncryptionKey:
+  # Verify client IP
+  #VerifyClientIp: false
+  EnableUserToken: true
+  VerifyClientIp: true
+OpenId:
+  ProviderUrl: https://myoidc-server.your.example.domain/realms/yourrealm
+  ClientId: 
+  ClientSecret: 
+  UsernameTemplate: "{{ username }}\x1f{{ token }}"
+  SplitUserDomain: false
+  
+# Capabilities - RDS Gateway features
+Caps:
+  SmartCardAuth: false
+  TokenAuth: true
+  EnablePrinter: true
+  EnablePort: true
+  EnablePnp: true
+  EnableDrive: true
+  EnableClipboard: true
+
+# Connection timeout (0 = unlimited)
+IdleTimeout: 0
+
+# Client settings
+Client:
+  NetworkAutoDetect: 0
+  BandwidthAutoDetect: 1
+  ConnectionType: 6
